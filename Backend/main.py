@@ -1,18 +1,16 @@
-import os
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from Backend.api.documents import router as documents_router
-from Backend.database.models import QueryLog, SessionLocal
+from Backend.database.models import DocumentLog, QueryLog, SessionLocal
 from Backend.rag.errors import RAGConfigurationError, RAGServiceError
 from Backend.rag.generator import AnswerGenerator
 from Backend.rag.retriever import Retriever
@@ -54,38 +52,63 @@ def health():
 
 
 @app.get("/status", tags=["Health"])
-def status(db: Session = Depends(get_db)):
-    try:
-        db.execute(text("SELECT 1"))
-        database_available = True
-    except Exception:
-        db.rollback()
-        database_available = False
+def service_status():
+    import os
 
     return {
-        "database_available": database_available,
         "pinecone_configured": bool(os.getenv("PINECONE_API_KEY")),
-        "llm_configured": bool(os.getenv("GROQ_API_KEY")),
+        "groq_configured": bool(os.getenv("GROQ_API_KEY")),
+    }
+
+
+@app.get("/documents", tags=["Documents"])
+def list_documents(db: Session = Depends(get_db)):
+    documents = (
+        db.query(DocumentLog)
+        .order_by(DocumentLog.uploaded_at.desc(), DocumentLog.id.desc())
+        .all()
+    )
+    return {
+        "total_documents": len(documents),
+        "documents": [
+            {
+                "filename": document.filename,
+                "status": "indexed",
+                "total_pages": document.total_pages,
+                "total_chunks": document.total_chunks,
+                "uploaded_at": (
+                    document.uploaded_at.isoformat()
+                    if document.uploaded_at is not None
+                    else None
+                ),
+            }
+            for document in documents
+        ],
     }
 
 
 @app.get("/history", tags=["History"])
-def query_history(db: Session = Depends(get_db)):
+def list_history(
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
     entries = (
         db.query(QueryLog)
-        .order_by(QueryLog.timestamp.desc())
-        .limit(50)
+        .order_by(QueryLog.timestamp.desc(), QueryLog.id.desc())
+        .limit(limit)
         .all()
     )
-    return [
-        {
-            "id": entry.id,
-            "question": entry.question,
-            "answer": entry.answer,
-            "timestamp": entry.timestamp.isoformat() if entry.timestamp else None,
-        }
-        for entry in entries
-    ]
+    return {
+        "history": [
+            {
+                "id": entry.id,
+                "question": entry.question,
+                "answer": entry.answer,
+                "timestamp": entry.timestamp.isoformat() if entry.timestamp else None,
+            }
+            for entry in entries
+        ],
+    }
 
 
 @app.post("/ask")

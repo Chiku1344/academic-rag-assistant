@@ -1,8 +1,10 @@
 from pathlib import Path, PureWindowsPath
 from uuid import uuid4
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from sqlalchemy.orm import Session
 
+from Backend.database.models import DocumentLog, SessionLocal
 from Backend.rag.loader import load_pdf
 from Backend.rag.chunker import chunk_documents
 from Backend.rag.embeddings import EmbeddingManager
@@ -15,8 +17,19 @@ UPLOAD_DIR = Path(__file__).resolve().parents[2] / "data" / "documents"
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
 @router.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
     filename = file.filename
     if (
         not filename
@@ -63,6 +76,14 @@ async def upload_document(file: UploadFile = File(...)):
 
         vector_store = PineconeVectorStore()
         vector_store.upsert_chunks(chunks, embeddings)
+        db.add(
+            DocumentLog(
+                filename=file_path.name,
+                total_pages=len(pages),
+                total_chunks=len(chunks),
+            )
+        )
+        db.commit()
 
         return {
             "message": "File uploaded and ingested successfully!",
@@ -73,6 +94,8 @@ async def upload_document(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except (RAGConfigurationError, RAGServiceError) as exc:
+        db.rollback()
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
+        db.rollback()
         raise HTTPException(status_code=500, detail="Unable to process and index the PDF.") from exc

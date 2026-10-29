@@ -1,15 +1,17 @@
+import datetime
 import os
 import tempfile
 import unittest
 import importlib
-from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, inspect
 
 from Backend.api import documents
+from Backend.database.models import DocumentLog, ensure_document_log_metrics
 from Backend.main import app, get_db
 from Backend.rag import chunker, embeddings, generator, loader, prompt, retriever, vector_store
 from Backend.rag.errors import RAGConfigurationError, RAGServiceError
@@ -53,6 +55,36 @@ class PDFAndChunkingTests(unittest.TestCase):
     def test_chunker_rejects_invalid_overlap(self):
         with self.assertRaises(ValueError):
             chunker.chunk_documents([], "source.pdf", chunk_size=10, chunk_overlap=10)
+
+
+class DatabaseMigrationTests(unittest.TestCase):
+    def test_document_metrics_migration_preserves_existing_rows(self):
+        test_engine = create_engine("sqlite://")
+        try:
+            with test_engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "CREATE TABLE document_logs "
+                    "(id INTEGER PRIMARY KEY, filename VARCHAR, uploaded_at DATETIME)"
+                )
+                connection.exec_driver_sql(
+                    "INSERT INTO document_logs (id, filename) VALUES (1, 'existing.pdf')"
+                )
+
+            ensure_document_log_metrics(test_engine)
+
+            columns = {
+                column["name"]
+                for column in inspect(test_engine).get_columns("document_logs")
+            }
+            with test_engine.connect() as connection:
+                filename = connection.exec_driver_sql(
+                    "SELECT filename FROM document_logs WHERE id = 1"
+                ).scalar_one()
+            self.assertIn("total_pages", columns)
+            self.assertIn("total_chunks", columns)
+            self.assertEqual(filename, "existing.pdf")
+        finally:
+            test_engine.dispose()
 
 
 class EmbeddingAndVectorStoreTests(unittest.TestCase):
@@ -227,7 +259,10 @@ class RetrievalAndGenerationTests(unittest.TestCase):
 class APITests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
-        app.dependency_overrides[get_db] = lambda: Mock()
+        self.db = Mock()
+        self.document_db = Mock()
+        app.dependency_overrides[get_db] = lambda: self.db
+        app.dependency_overrides[documents.get_db] = lambda: self.document_db
 
     def tearDown(self):
         app.dependency_overrides.clear()
@@ -243,10 +278,55 @@ class APITests(unittest.TestCase):
         self.assertIn("text/html", docs_response.headers["content-type"])
         self.assertEqual(openapi_response.status_code, 200)
 
-    def test_status_reports_configuration_presence_without_secret_values(self):
-        db = Mock()
-        db.execute.return_value = 1
-        app.dependency_overrides[get_db] = lambda: db
+    def test_document_inventory_returns_only_logged_indexed_documents(self):
+        uploaded_at = datetime.datetime(2026, 10, 29, 12, 0)
+        document = SimpleNamespace(
+            id=4,
+            filename="research.pdf",
+            total_pages=7,
+            total_chunks=18,
+            uploaded_at=uploaded_at,
+        )
+        query = self.db.query.return_value
+        query.order_by.return_value.all.return_value = [document]
+
+        response = self.client.get("/documents")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            "total_documents": 1,
+            "documents": [{
+                "filename": "research.pdf",
+                "status": "indexed",
+                "total_pages": 7,
+                "total_chunks": 18,
+                "uploaded_at": "2026-10-29T12:00:00",
+            }],
+        })
+
+    def test_history_returns_saved_answers_in_database_order(self):
+        history_db = Mock()
+        history_db.query.return_value.order_by.return_value.limit.return_value.all.return_value = [
+            SimpleNamespace(
+                id=3,
+                question="Question",
+                answer="Answer",
+                timestamp=datetime.datetime(2026, 10, 29, 12, 0),
+            )
+        ]
+        app.dependency_overrides[get_db] = lambda: history_db
+
+        response = self.client.get("/history?limit=10")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["history"][0], {
+            "id": 3,
+            "question": "Question",
+            "answer": "Answer",
+            "timestamp": "2026-10-29T12:00:00",
+        })
+
+    def test_status_returns_only_provider_configuration_booleans(self):
         with patch.dict(
             os.environ,
             {"PINECONE_API_KEY": "test-key", "GROQ_API_KEY": ""},
@@ -254,34 +334,11 @@ class APITests(unittest.TestCase):
             response = self.client.get("/status")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.json(),
-            {
-                "database_available": True,
-                "pinecone_configured": True,
-                "llm_configured": False,
-            },
-        )
+        self.assertEqual(response.json(), {
+            "pinecone_configured": True,
+            "groq_configured": False,
+        })
         self.assertNotIn("test-key", response.text)
-
-    def test_history_returns_saved_database_records(self):
-        entry = SimpleNamespace(
-            id=5,
-            question="Saved question",
-            answer="Saved answer",
-            timestamp=datetime(2026, 10, 29, 12, 0),
-        )
-        db = Mock()
-        db.query.return_value.order_by.return_value.limit.return_value.all.return_value = [entry]
-        app.dependency_overrides[get_db] = lambda: db
-
-        response = self.client.get("/history")
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()[0]["id"], 5)
-        self.assertEqual(response.json()[0]["question"], "Saved question")
-        self.assertEqual(response.json()[0]["answer"], "Saved answer")
-        self.assertEqual(response.json()[0]["timestamp"], "2026-10-29T12:00:00")
 
     def test_ask_returns_citations_matching_frontend_contract(self):
         fake_retriever = Mock()
@@ -360,6 +417,46 @@ class APITests(unittest.TestCase):
             fake_store.upsert_chunks.assert_called_once_with(
                 chunk_data, fake_embedder.embed_texts.return_value
             )
+            self.document_db.add.assert_called_once()
+            self.assertIsInstance(self.document_db.add.call_args.args[0], DocumentLog)
+            self.assertEqual(self.document_db.add.call_args.args[0].filename, "paper.PDF")
+            self.assertEqual(self.document_db.add.call_args.args[0].total_pages, 1)
+            self.assertEqual(self.document_db.add.call_args.args[0].total_chunks, 1)
+            self.document_db.commit.assert_called_once()
+
+    def test_upload_duplicate_filename_keeps_existing_file_and_uses_unique_name(self):
+        fake_embedder = Mock()
+        fake_embedder.embed_texts.return_value = [[0.0] * 384]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original = Path(temp_dir) / "paper.pdf"
+            original.write_bytes(b"existing file")
+            with (
+                patch.object(documents, "UPLOAD_DIR", Path(temp_dir)),
+                patch.object(
+                    documents,
+                    "load_pdf",
+                    return_value=[{"page_number": 1, "text": "PDF text"}],
+                ),
+                patch.object(
+                    documents,
+                    "chunk_documents",
+                    return_value=[{
+                        "id": "paper.pdf_chunk_1",
+                        "text": "PDF text",
+                        "metadata": {"source": "paper.pdf", "page": 1},
+                    }],
+                ),
+                patch.object(documents, "EmbeddingManager", return_value=fake_embedder),
+                patch.object(documents, "PineconeVectorStore"),
+            ):
+                response = self.client.post(
+                    "/documents/upload",
+                    files={"file": ("paper.pdf", b"%PDF-1.7 mocked body", "application/pdf")},
+                )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertNotEqual(response.json()["filename"], "paper.pdf")
+            self.assertEqual(original.read_bytes(), b"existing file")
 
     def test_upload_rejects_non_pdf_bytes(self):
         response = self.client.post(
@@ -377,38 +474,6 @@ class APITests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 400)
-
-    def test_upload_uses_a_new_name_when_the_filename_already_exists(self):
-        fake_embedder = Mock()
-        fake_embedder.embed_texts.return_value = [[0.0] * 384]
-        page_data = [{"page_number": 1, "text": "PDF text"}]
-        chunk_data = [
-            {
-                "id": "paper.pdf_chunk_1",
-                "text": "PDF text",
-                "metadata": {"source": "paper.pdf", "page": 1},
-            }
-        ]
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            (Path(temp_dir) / "paper.pdf").write_bytes(b"existing file")
-            with (
-                patch.object(documents, "UPLOAD_DIR", Path(temp_dir)),
-                patch.object(documents, "load_pdf", return_value=page_data),
-                patch.object(documents, "chunk_documents", return_value=chunk_data),
-                patch.object(documents, "EmbeddingManager", return_value=fake_embedder),
-                patch.object(documents, "PineconeVectorStore"),
-            ):
-                response = self.client.post(
-                    "/documents/upload",
-                    files={"file": ("paper.pdf", b"%PDF-1.7 mocked body", "application/pdf")},
-                )
-
-            self.assertEqual(response.status_code, 200)
-            stored_name = response.json()["filename"]
-            self.assertRegex(stored_name, r"^paper_[0-9a-f]{8}\.pdf$")
-            self.assertEqual((Path(temp_dir) / "paper.pdf").read_bytes(), b"existing file")
-            self.assertTrue((Path(temp_dir) / stored_name).exists())
 
 
 if __name__ == "__main__":
