@@ -4,8 +4,8 @@ from .vector_store import PineconeVectorStore
 
 class Retriever:
     def __init__(self):
-        self.embedder = EmbeddingManager()
         self.vector_store = PineconeVectorStore()
+        self.embedder = EmbeddingManager()
 
     def search(self, query: str, top_k: int = 3):
         """Retrieves top-k relevant document chunks for a question."""

@@ -90,7 +90,7 @@ class DatabaseMigrationTests(unittest.TestCase):
 class EmbeddingAndVectorStoreTests(unittest.TestCase):
     def test_embedding_manager_checks_model_output_dimension(self):
         fake_model = Mock()
-        fake_model.get_sentence_embedding_dimension.return_value = 384
+        fake_model.get_embedding_dimension.return_value = 384
         fake_model.encode.return_value.tolist.return_value = [[0.1] * 384]
         with patch.object(embeddings, "SentenceTransformer", return_value=fake_model):
             manager = embeddings.EmbeddingManager()
@@ -101,7 +101,7 @@ class EmbeddingAndVectorStoreTests(unittest.TestCase):
 
     def test_embedding_manager_rejects_incompatible_model(self):
         fake_model = Mock()
-        fake_model.get_sentence_embedding_dimension.return_value = 768
+        fake_model.get_embedding_dimension.return_value = 768
         with patch.object(embeddings, "SentenceTransformer", return_value=fake_model):
             with self.assertRaises(RAGServiceError):
                 embeddings.EmbeddingManager()
@@ -380,6 +380,22 @@ class APITests(unittest.TestCase):
             side_effect=RAGConfigurationError("PINECONE_API_KEY is not configured."),
         ):
             response = self.client.post("/ask", json={"question": "question"})
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "PINECONE_API_KEY is not configured.")
+
+    def test_ask_rejects_whitespace_question_as_validation_error(self):
+        response = self.client.post("/ask", json={"question": "   "})
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("Question must not be blank.", response.text)
+
+    def test_ask_reports_missing_pinecone_configuration(self):
+        with patch.dict(os.environ, {"PINECONE_API_KEY": ""}):
+            response = self.client.post(
+                "/ask",
+                json={"question": "What is normalization?"},
+            )
 
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["detail"], "PINECONE_API_KEY is not configured.")

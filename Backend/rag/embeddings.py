@@ -8,7 +8,7 @@ class EmbeddingManager:
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
         try:
             self.model = SentenceTransformer(model_name)
-            dimension = self.model.get_sentence_embedding_dimension()
+            dimension = self.model.get_embedding_dimension()
         except Exception as exc:
             raise RAGServiceError("The embedding model could not be loaded.") from exc
         if dimension != EMBEDDING_DIMENSION:

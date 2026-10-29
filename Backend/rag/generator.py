@@ -11,10 +11,10 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
 class AnswerGenerator:
-    def __init__(self, model_name: str = "llama-3.3-70b-versatile"):
+    def __init__(self, model_name: str | None = None):
         self.api_key = os.getenv("GROQ_API_KEY")
         self.client = None
-        self.model_name = model_name
+        self.model_name = model_name or os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
     def generate_answer(self, query: str, retrieved_docs: list[dict]) -> str:
         if not retrieved_docs:

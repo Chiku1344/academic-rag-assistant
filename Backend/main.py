@@ -6,7 +6,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
 from Backend.api.documents import router as documents_router
@@ -39,6 +39,14 @@ def get_db():
 class QuestionRequest(BaseModel):
     question: str = Field(min_length=1)
     top_k: int = Field(default=3, ge=1, le=20)
+
+    @field_validator("question")
+    @classmethod
+    def question_must_contain_non_whitespace(cls, value: str) -> str:
+        question = value.strip()
+        if not question:
+            raise ValueError("Question must not be blank.")
+        return question
 
 
 @app.get("/")
